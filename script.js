@@ -1,4 +1,3 @@
-
 (() => {
   const root = document.documentElement;
   const toggle = document.querySelector('.lang-toggle');
@@ -17,8 +16,8 @@
 
     pdfLinks.forEach((link) => {
       link.href = lang === 'ru'
-        ? 'assets/Roman_Belysh_Portfolio_RU.pdf'
-        : 'assets/Roman_Belysh_Portfolio_EN.pdf';
+        ? 'Roman_Belysh_Portfolio_RU.pdf'
+        : 'Roman_Belysh_Portfolio_EN.pdf';
     });
     document.title = lang === 'ru'
       ? 'Roman Belysh — 3D Product Designer'
