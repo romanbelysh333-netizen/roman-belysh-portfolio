@@ -10,67 +10,116 @@ permissions:
 jobs:
   extract:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install dependencies
-        run: pip install requests beautifulsoup4 pillow
-      - name: Extract images
+      - name: Install browser and dependencies
+        run: |
+          pip install playwright requests pillow
+          python -m playwright install --with-deps chromium
+      - name: Extract original page images
         run: |
           python - <<'PY'
-          import os, re, json, hashlib
+          import os, re, json, hashlib, time
           from io import BytesIO
           from urllib.parse import urljoin
           import requests
-          from bs4 import BeautifulSoup
           from PIL import Image
+          from playwright.sync_api import sync_playwright
 
-          page_url = 'https://oaok.ru/cg-models/models/anime/milaya_anime_figurka_krolika_kawaii_chibi_rabbit_10_sm_6409_75125/'
-          out_dir = 'oaok_rabbit_download'
-          img_dir = os.path.join(out_dir, 'images')
-          os.makedirs(img_dir, exist_ok=True)
+          PAGE_URL = 'https://oaok.ru/cg-models/models/anime/milaya_anime_figurka_krolika_kawaii_chibi_rabbit_10_sm_6409_75125/'
+          OUT = 'oaok_rabbit_download'
+          IMG = os.path.join(OUT, 'images')
+          os.makedirs(IMG, exist_ok=True)
+          urls = set()
 
-          s = requests.Session()
-          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36','Accept-Language':'ru-RU,ru;q=0.9,en;q=0.8','Referer':'https://oaok.ru/'})
-          r=s.get(page_url,timeout=60); r.raise_for_status(); html=r.text
-          open(os.path.join(out_dir,'page.html'),'w',encoding='utf-8').write(html)
-          soup=BeautifulSoup(html,'html.parser')
-          urls=[]
-          for tag in soup.find_all(True):
-              for a in ['src','data-src','data-lazy','data-original','data-image','data-full','href','content','poster']:
-                  v=tag.get(a)
-                  if v and isinstance(v,str): urls.append(v)
-              for a in ['srcset','data-srcset']:
-                  v=tag.get(a)
-                  if v:
-                      urls += [p.strip().split()[0] for p in v.split(',') if p.strip()]
-          raw=html.replace('\\/','/')
-          urls += re.findall(r'https?://[^\"\'<>\\s]+', raw)
-          urls += re.findall(r'[\"\']([^\"\']+\.(?:jpe?g|png|webp|avif)(?:\?[^\"\']*)?)[\"\']', raw, flags=re.I)
-          norm=[]; seen=set()
-          for u in urls:
-              u=urljoin(page_url,u.strip().replace('&amp;','&'))
-              if not u.startswith('http') or u in seen: continue
-              seen.add(u); norm.append(u)
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page(viewport={'width': 1600, 'height': 1200}, device_scale_factor=1)
+
+              def on_response(resp):
+                  try:
+                      ct = (resp.headers.get('content-type') or '').lower()
+                      if ct.startswith('image/'):
+                          urls.add(resp.url)
+                  except Exception:
+                      pass
+
+              page.on('response', on_response)
+              page.goto(PAGE_URL, wait_until='domcontentloaded', timeout=90000)
+              page.wait_for_timeout(5000)
+
+              # Load lazy images by scrolling through the whole page.
+              height = page.evaluate('document.body.scrollHeight')
+              y = 0
+              while y < height:
+                  page.evaluate(f'window.scrollTo(0, {y})')
+                  page.wait_for_timeout(500)
+                  y += 800
+                  height = max(height, page.evaluate('document.body.scrollHeight'))
+              page.evaluate('window.scrollTo(0, 0)')
+              page.wait_for_timeout(2500)
+
+              # Collect image URLs from all common attributes and CSS backgrounds.
+              attrs = page.locator('img, source, [style*="background"]').evaluate_all('''els => {
+                const out=[];
+                for (const el of els) {
+                  for (const a of ['src','data-src','data-lazy','data-original','data-image','data-full','poster']) {
+                    const v=el.getAttribute && el.getAttribute(a); if(v) out.push(v);
+                  }
+                  if(el.currentSrc) out.push(el.currentSrc);
+                  for (const a of ['srcset','data-srcset']) {
+                    const v=el.getAttribute && el.getAttribute(a); if(v) for(const p of v.split(',')) out.push(p.trim().split(/\\s+/)[0]);
+                  }
+                  const bg=getComputedStyle(el).backgroundImage;
+                  if(bg && bg!=='none') {
+                    for(const m of bg.matchAll(/url\\(["']?(.*?)["']?\\)/g)) out.push(m[1]);
+                  }
+                }
+                return out;
+              }''')
+              for u in attrs:
+                  if u: urls.add(urljoin(PAGE_URL, u))
+
+              # Browser network resource list catches lazy-loaded and script-fetched images.
+              perf = page.evaluate('performance.getEntriesByType("resource").map(e => e.name)')
+              for u in perf:
+                  if re.search(r'\\.(?:jpe?g|png|webp|avif)(?:\\?|$)', u, re.I): urls.add(u)
+
+              page.screenshot(path=os.path.join(OUT, 'full_page.png'), full_page=True)
+              open(os.path.join(OUT, 'rendered.html'), 'w', encoding='utf-8').write(page.content())
+              browser.close()
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36',
+              'Referer': PAGE_URL,
+              'Accept':'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+          })
           records=[]
-          for u in norm:
+          for u in list(urls)[:150]:
               try:
-                  rr=s.get(u,timeout=45,allow_redirects=True)
-                  if rr.status_code!=200 or not rr.headers.get('content-type','').lower().startswith('image/'): continue
-                  data=rr.content
-                  if len(data)<5000: continue
-                  im=Image.open(BytesIO(data)); w,h=im.size; fmt=(im.format or 'jpg').lower(); ext={'jpeg':'jpg'}.get(fmt,fmt)
+                  r=session.get(u,timeout=12,allow_redirects=True)
+                  ct=(r.headers.get('content-type') or '').lower()
+                  if r.status_code != 200 or not ct.startswith('image/') or len(r.content)<5000: continue
+                  im=Image.open(BytesIO(r.content)); w,h=im.size
                   if max(w,h)<500 or w*h<220000: continue
-                  name=f'{len(records)+1:02d}_{w}x{h}_{hashlib.sha1(u.encode()).hexdigest()[:8]}.{ext if ext in ("jpg","png","webp","avif") else "jpg"}'
-                  open(os.path.join(img_dir,name),'wb').write(data)
-                  records.append({'file':name,'url':u,'width':w,'height':h,'bytes':len(data)})
+                  fmt=(im.format or 'jpeg').lower(); ext={'jpeg':'jpg'}.get(fmt,fmt)
+                  if ext not in ('jpg','png','webp','avif'): ext='jpg'
+                  digest=hashlib.sha1(r.content).hexdigest()
+                  if any(x['sha1']==digest for x in records): continue
+                  name=f'{len(records)+1:02d}_{w}x{h}.{ext}'
+                  open(os.path.join(IMG,name),'wb').write(r.content)
+                  records.append({'file':name,'url':u,'width':w,'height':h,'bytes':len(r.content),'sha1':digest})
               except Exception:
                   pass
-          open(os.path.join(out_dir,'manifest.json'),'w',encoding='utf-8').write(json.dumps(records,ensure_ascii=False,indent=2))
-          open(os.path.join(out_dir,'all_candidate_urls.txt'),'w',encoding='utf-8').write('\n'.join(norm))
-          print('saved',len(records),'of',len(norm))
+
+          open(os.path.join(OUT,'manifest.json'),'w',encoding='utf-8').write(json.dumps(records,ensure_ascii=False,indent=2))
+          open(os.path.join(OUT,'image_urls.txt'),'w',encoding='utf-8').write('\n'.join(sorted(urls)))
+          print(f'Found {len(urls)} image URLs; saved {len(records)} substantial unique images')
           PY
       - uses: actions/upload-artifact@v4
         with:
