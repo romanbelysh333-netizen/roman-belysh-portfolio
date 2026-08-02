@@ -1,0 +1,128 @@
+name: Temporary OAOK rabbit image extractor
+
+on:
+  push:
+    branches:
+      - tmp-oaok-rabbit-download-20260803
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp-oaok-rabbit-download-20260803
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pillow
+      - name: Extract and download images
+        run: |
+          python - <<'PY'
+          import os, re, json, hashlib
+          from io import BytesIO
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+
+          page_url = 'https://oaok.ru/cg-models/models/anime/milaya_anime_figurka_krolika_kawaii_chibi_rabbit_10_sm_6409_75125/'
+          out_dir = 'tmp_oaok_rabbit'
+          img_dir = os.path.join(out_dir, 'images')
+          os.makedirs(img_dir, exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36',
+              'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+              'Referer': 'https://oaok.ru/'
+          })
+          r = s.get(page_url, timeout=60)
+          r.raise_for_status()
+          html = r.text
+          open(os.path.join(out_dir, 'page.html'), 'w', encoding='utf-8').write(html)
+
+          soup = BeautifulSoup(html, 'html.parser')
+          urls = []
+          attrs = ['src','data-src','data-lazy','data-original','data-image','data-full','href']
+          for tag in soup.find_all(['img','source','a','meta','link']):
+              for a in attrs:
+                  v = tag.get(a)
+                  if v:
+                      urls.append(v)
+              for a in ['srcset','data-srcset']:
+                  v = tag.get(a)
+                  if v:
+                      for part in v.split(','):
+                          urls.append(part.strip().split()[0])
+              if tag.name == 'meta' and tag.get('content'):
+                  p = (tag.get('property') or tag.get('name') or '').lower()
+                  if 'image' in p:
+                      urls.append(tag['content'])
+
+          # URLs embedded in scripts / JSON / CSS.
+          raw = html.replace('\\/', '/')
+          for m in re.findall(r'https?://[^\"\'<>\\s]+', raw):
+              urls.append(m)
+          for m in re.findall(r'[\"\']([^\"\']+\.(?:jpe?g|png|webp|avif)(?:\?[^\"\']*)?)[\"\']', raw, flags=re.I):
+              urls.append(m)
+
+          normalized = []
+          seen = set()
+          for u in urls:
+              u = u.strip().replace('&amp;', '&')
+              if not u or u.startswith(('data:','javascript:','#')):
+                  continue
+              u = urljoin(page_url, u)
+              if u in seen:
+                  continue
+              seen.add(u)
+              normalized.append(u)
+
+          records = []
+          saved = 0
+          for i, u in enumerate(normalized):
+              try:
+                  rr = s.get(u, timeout=45, allow_redirects=True)
+                  ct = rr.headers.get('content-type','').lower()
+                  if rr.status_code != 200 or not ct.startswith('image/'):
+                      continue
+                  data = rr.content
+                  if len(data) < 5000:
+                      continue
+                  try:
+                      im = Image.open(BytesIO(data))
+                      w,h = im.size
+                      fmt = (im.format or 'jpg').lower()
+                  except Exception:
+                      continue
+                  # Keep substantial images; tiny UI icons/logos are excluded.
+                  if max(w,h) < 500 or w*h < 220000:
+                      continue
+                  ext = {'jpeg':'jpg'}.get(fmt, fmt)
+                  if ext not in ('jpg','png','webp','avif'):
+                      ext = 'jpg'
+                  name = f'{saved+1:02d}_{w}x{h}_{hashlib.sha1(u.encode()).hexdigest()[:8]}.{ext}'
+                  path = os.path.join(img_dir, name)
+                  open(path,'wb').write(data)
+                  records.append({'file':name,'url':u,'width':w,'height':h,'bytes':len(data),'content_type':ct})
+                  saved += 1
+              except Exception as e:
+                  pass
+
+          open(os.path.join(out_dir, 'manifest.json'), 'w', encoding='utf-8').write(json.dumps(records, ensure_ascii=False, indent=2))
+          open(os.path.join(out_dir, 'all_candidate_urls.txt'), 'w', encoding='utf-8').write('\n'.join(normalized))
+          print(f'HTML bytes: {len(html)}, candidates: {len(normalized)}, saved: {saved}')
+          PY
+      - name: Commit extracted files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tmp_oaok_rabbit
+          git commit -m 'Extract OAOK rabbit images [skip oaok]' || exit 0
+          git push origin HEAD:tmp-oaok-rabbit-download-20260803
