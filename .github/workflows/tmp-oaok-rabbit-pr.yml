@@ -1,0 +1,79 @@
+name: Temporary OAOK rabbit extractor PR
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pillow
+      - name: Extract images
+        run: |
+          python - <<'PY'
+          import os, re, json, hashlib
+          from io import BytesIO
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+
+          page_url = 'https://oaok.ru/cg-models/models/anime/milaya_anime_figurka_krolika_kawaii_chibi_rabbit_10_sm_6409_75125/'
+          out_dir = 'oaok_rabbit_download'
+          img_dir = os.path.join(out_dir, 'images')
+          os.makedirs(img_dir, exist_ok=True)
+
+          s = requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36','Accept-Language':'ru-RU,ru;q=0.9,en;q=0.8','Referer':'https://oaok.ru/'})
+          r=s.get(page_url,timeout=60); r.raise_for_status(); html=r.text
+          open(os.path.join(out_dir,'page.html'),'w',encoding='utf-8').write(html)
+          soup=BeautifulSoup(html,'html.parser')
+          urls=[]
+          for tag in soup.find_all(True):
+              for a in ['src','data-src','data-lazy','data-original','data-image','data-full','href','content','poster']:
+                  v=tag.get(a)
+                  if v and isinstance(v,str): urls.append(v)
+              for a in ['srcset','data-srcset']:
+                  v=tag.get(a)
+                  if v:
+                      urls += [p.strip().split()[0] for p in v.split(',') if p.strip()]
+          raw=html.replace('\\/','/')
+          urls += re.findall(r'https?://[^\"\'<>\\s]+', raw)
+          urls += re.findall(r'[\"\']([^\"\']+\.(?:jpe?g|png|webp|avif)(?:\?[^\"\']*)?)[\"\']', raw, flags=re.I)
+          norm=[]; seen=set()
+          for u in urls:
+              u=urljoin(page_url,u.strip().replace('&amp;','&'))
+              if not u.startswith('http') or u in seen: continue
+              seen.add(u); norm.append(u)
+          records=[]
+          for u in norm:
+              try:
+                  rr=s.get(u,timeout=45,allow_redirects=True)
+                  if rr.status_code!=200 or not rr.headers.get('content-type','').lower().startswith('image/'): continue
+                  data=rr.content
+                  if len(data)<5000: continue
+                  im=Image.open(BytesIO(data)); w,h=im.size; fmt=(im.format or 'jpg').lower(); ext={'jpeg':'jpg'}.get(fmt,fmt)
+                  if max(w,h)<500 or w*h<220000: continue
+                  name=f'{len(records)+1:02d}_{w}x{h}_{hashlib.sha1(u.encode()).hexdigest()[:8]}.{ext if ext in ("jpg","png","webp","avif") else "jpg"}'
+                  open(os.path.join(img_dir,name),'wb').write(data)
+                  records.append({'file':name,'url':u,'width':w,'height':h,'bytes':len(data)})
+              except Exception:
+                  pass
+          open(os.path.join(out_dir,'manifest.json'),'w',encoding='utf-8').write(json.dumps(records,ensure_ascii=False,indent=2))
+          open(os.path.join(out_dir,'all_candidate_urls.txt'),'w',encoding='utf-8').write('\n'.join(norm))
+          print('saved',len(records),'of',len(norm))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oaok-rabbit-images
+          path: oaok_rabbit_download
+          if-no-files-found: error
